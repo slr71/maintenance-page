@@ -29,6 +29,8 @@ type MockK8sClient struct {
 	isMaintError   error
 	setMaintError  error
 	ensureSvcError error
+	enableCalls    int
+	disableCalls   int
 }
 
 // EnsureService is a mock implementation of EnsureService.
@@ -41,16 +43,23 @@ func (m *MockK8sClient) IsMaintenanceMode(ctx context.Context, routeName, mainte
 	return m.isMaintenance, m.isMaintError
 }
 
-// SetMaintenanceMode is a mock implementation of SetMaintenanceMode.
-func (m *MockK8sClient) SetMaintenanceMode(ctx context.Context, routeName, targetServiceName string, targetPort int32, knownServices []string) error {
+// EnableMaintenanceMode is a mock implementation of EnableMaintenanceMode.
+func (m *MockK8sClient) EnableMaintenanceMode(ctx context.Context, routeName, maintenanceServiceName string, maintenancePort int32) error {
+	m.enableCalls++
 	if m.setMaintError != nil {
 		return m.setMaintError
 	}
-	if targetServiceName == "maintenance-page" {
-		m.isMaintenance = true
-	} else {
-		m.isMaintenance = false
+	m.isMaintenance = true
+	return nil
+}
+
+// DisableMaintenanceMode is a mock implementation of DisableMaintenanceMode.
+func (m *MockK8sClient) DisableMaintenanceMode(ctx context.Context, routeName, maintenanceServiceName, fallbackServiceName string, fallbackPort int32) error {
+	m.disableCalls++
+	if m.setMaintError != nil {
+		return m.setMaintError
 	}
+	m.isMaintenance = false
 	return nil
 }
 

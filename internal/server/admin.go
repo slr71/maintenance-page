@@ -107,26 +107,15 @@ func (a *AdminApp) HandleToggle(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
-	var targetSvc string
-	var targetPort int32
+	a.log.WithField("currentMaintenance", isMaint).Info("toggling maintenance mode")
 
 	if isMaint {
-		targetSvc = a.deUIServiceName
-		targetPort = a.deUIServicePort
+		err = a.k8sClient.DisableMaintenanceMode(ctx, a.httpRouteName, a.maintenanceServiceName, a.deUIServiceName, a.deUIServicePort)
 	} else {
-		targetSvc = a.maintenanceServiceName
-		targetPort = a.maintenanceServicePort
+		err = a.k8sClient.EnableMaintenanceMode(ctx, a.httpRouteName, a.maintenanceServiceName, a.maintenanceServicePort)
 	}
-
-	a.log.WithFields(logrus.Fields{
-		"currentMaintenance": isMaint,
-		"targetService":      targetSvc,
-		"targetPort":         targetPort,
-	}).Info("toggling maintenance mode")
-
-	err = a.k8sClient.SetMaintenanceMode(ctx, a.httpRouteName, targetSvc, targetPort, []string{a.maintenanceServiceName, a.deUIServiceName})
 	if err != nil {
-		a.log.WithError(err).WithField("targetService", targetSvc).Error("failed to set maintenance mode")
+		a.log.WithError(err).Error("failed to toggle maintenance mode")
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 

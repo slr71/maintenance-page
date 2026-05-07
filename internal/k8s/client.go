@@ -2,9 +2,9 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -18,7 +18,15 @@ import (
 	gatewayclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 )
 
-// ErrNoSuitableRules is returned when no HTTPRoute rules match the known services to update.
+// AnnotationOriginalBackends is the HTTPRoute annotation under which the per-rule
+// BackendRefs snapshot is stored while maintenance mode is active. The value is a
+// JSON-encoded slice (one entry per rule, indexed positionally) of HTTPBackendRef
+// lists, captured by EnableMaintenanceMode and consumed by DisableMaintenanceMode.
+const AnnotationOriginalBackends = "cyverse.org/maintenance-original-backends"
+
+// ErrNoSuitableRules is returned when an HTTPRoute has no rules to redirect or
+// restore — for example, when DisableMaintenanceMode's legacy fallback finds no
+// rules currently pointing at the maintenance service.
 var ErrNoSuitableRules = errors.New("no suitable rules found in HTTPRoute to update")
 
 // K8sClient defines the interface for interacting with Kubernetes resources needed for maintenance mode.
@@ -27,9 +35,15 @@ type K8sClient interface {
 	EnsureService(ctx context.Context, name string, port, targetPort int32, labels map[string]string) error
 	// IsMaintenanceMode returns true if the specified HTTPRoute points to the maintenance service.
 	IsMaintenanceMode(ctx context.Context, routeName, maintenanceServiceName string) (bool, error)
-	// SetMaintenanceMode updates the specified HTTPRoute to point to the target service.
-	// Only rules whose current backend is in knownServices will be updated.
-	SetMaintenanceMode(ctx context.Context, routeName, targetServiceName string, servicePort int32, knownServices []string) error
+	// EnableMaintenanceMode redirects every rule in the HTTPRoute to the maintenance service,
+	// recording each rule's original BackendRefs in an annotation so they can be restored later.
+	// Calling it on a route that is already in maintenance is a no-op.
+	EnableMaintenanceMode(ctx context.Context, routeName, maintenanceServiceName string, maintenancePort int32) error
+	// DisableMaintenanceMode restores the per-rule BackendRefs saved by EnableMaintenanceMode and
+	// clears the annotation. If the annotation is missing (e.g., maintenance was enabled by an older
+	// version of this code), it falls back to redirecting any rule still pointing at the maintenance
+	// service to fallbackServiceName.
+	DisableMaintenanceMode(ctx context.Context, routeName, maintenanceServiceName, fallbackServiceName string, fallbackPort int32) error
 }
 
 // Client is a Kubernetes client that implements the K8sClient interface.
@@ -133,13 +147,14 @@ func (c *Client) IsMaintenanceMode(ctx context.Context, routeName, maintenanceSe
 	return false, nil
 }
 
-// SetMaintenanceMode updates the specified HTTPRoute to point to the target service.
-// Only rules whose current backend is in knownServices will be updated, preventing
-// accidental modification of rules pointing to unrelated services.
-func (c *Client) SetMaintenanceMode(ctx context.Context, routeName, targetServiceName string, servicePort int32, knownServices []string) error {
+// EnableMaintenanceMode redirects every rule in the HTTPRoute to the maintenance service.
+// The current per-rule BackendRefs are serialized as JSON into AnnotationOriginalBackends so
+// that DisableMaintenanceMode can restore them. If the annotation is already present the
+// route is considered to already be in maintenance and the call is a no-op.
+func (c *Client) EnableMaintenanceMode(ctx context.Context, routeName, maintenanceServiceName string, maintenancePort int32) error {
 	log := c.log.WithFields(logrus.Fields{
 		"route":  routeName,
-		"target": targetServiceName,
+		"target": maintenanceServiceName,
 	})
 
 	route, err := c.gatewayClient.GatewayV1().HTTPRoutes(c.namespace).Get(ctx, routeName, metav1.GetOptions{})
@@ -147,51 +162,119 @@ func (c *Client) SetMaintenanceMode(ctx context.Context, routeName, targetServic
 		return fmt.Errorf("failed to get HTTPRoute %s: %w", routeName, err)
 	}
 
-	targetPort := gatewayv1.PortNumber(servicePort)
-	targetName := gatewayv1.ObjectName(targetServiceName)
+	if len(route.Spec.Rules) == 0 {
+		return fmt.Errorf("HTTPRoute %s: %w", routeName, ErrNoSuitableRules)
+	}
 
+	// Idempotency guard: if the snapshot annotation already exists, assume maintenance
+	// is already on. Re-snapshotting now would record maintenance-page as the "original"
+	// backend for every rule, permanently destroying the real backends.
+	if _, ok := route.Annotations[AnnotationOriginalBackends]; ok {
+		log.Debug("maintenance already enabled; nothing to do")
+		return nil
+	}
+
+	snapshot := make([][]gatewayv1.HTTPBackendRef, len(route.Spec.Rules))
+	for i, rule := range route.Spec.Rules {
+		snapshot[i] = rule.BackendRefs
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("failed to encode original backends for HTTPRoute %s: %w", routeName, err)
+	}
+	if route.Annotations == nil {
+		route.Annotations = map[string]string{}
+	}
+	route.Annotations[AnnotationOriginalBackends] = string(encoded)
+
+	maintRef := []gatewayv1.HTTPBackendRef{newBackendRef(maintenanceServiceName, maintenancePort)}
+	for i := range route.Spec.Rules {
+		route.Spec.Rules[i].BackendRefs = maintRef
+	}
+
+	if _, err := c.gatewayClient.GatewayV1().HTTPRoutes(c.namespace).Update(ctx, route, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("failed to update HTTPRoute %s: %w", routeName, err)
+	}
+
+	log.Info("enabled maintenance mode")
+	return nil
+}
+
+// DisableMaintenanceMode reverses EnableMaintenanceMode by reading the snapshot annotation
+// and restoring each rule's original BackendRefs. If the annotation is absent, it falls back
+// to legacy behavior: any rule whose backend is the maintenance service is redirected to
+// fallbackServiceName. The legacy path returns ErrNoSuitableRules if it finds no such rule.
+func (c *Client) DisableMaintenanceMode(ctx context.Context, routeName, maintenanceServiceName, fallbackServiceName string, fallbackPort int32) error {
+	log := c.log.WithFields(logrus.Fields{
+		"route":    routeName,
+		"fallback": fallbackServiceName,
+	})
+
+	route, err := c.gatewayClient.GatewayV1().HTTPRoutes(c.namespace).Get(ctx, routeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get HTTPRoute %s: %w", routeName, err)
+	}
+
+	if encoded, ok := route.Annotations[AnnotationOriginalBackends]; ok && encoded != "" {
+		var snapshot [][]gatewayv1.HTTPBackendRef
+		if err := json.Unmarshal([]byte(encoded), &snapshot); err != nil {
+			return fmt.Errorf("failed to decode original backends annotation on HTTPRoute %s: %w", routeName, err)
+		}
+
+		// Restore positionally. If a rule was added during maintenance the snapshot
+		// has no entry at that index; leave the new rule untouched.
+		for i := range route.Spec.Rules {
+			if i >= len(snapshot) {
+				break
+			}
+			route.Spec.Rules[i].BackendRefs = snapshot[i]
+		}
+		delete(route.Annotations, AnnotationOriginalBackends)
+
+		if _, err := c.gatewayClient.GatewayV1().HTTPRoutes(c.namespace).Update(ctx, route, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("failed to update HTTPRoute %s: %w", routeName, err)
+		}
+
+		log.Info("disabled maintenance mode (restored from annotation)")
+		return nil
+	}
+
+	// Legacy fallback: the route was put into maintenance by a previous version that did
+	// not write the snapshot annotation. Redirect any maintenance-backed rule to the
+	// fallback service. This is one-shot — once restored, future toggles use the snapshot.
+	log.Warn("snapshot annotation missing; using legacy fallback to disable maintenance")
+	fallbackRef := []gatewayv1.HTTPBackendRef{newBackendRef(fallbackServiceName, fallbackPort)}
 	updated := false
 	for i, rule := range route.Spec.Rules {
-		shouldUpdateRule := false
-		var oldTarget string
 		for _, backend := range rule.BackendRefs {
-			name := string(backend.Name)
-			if slices.Contains(knownServices, name) {
-				shouldUpdateRule = true
-				oldTarget = name
+			if string(backend.Name) == maintenanceServiceName {
+				route.Spec.Rules[i].BackendRefs = fallbackRef
+				updated = true
 				break
 			}
 		}
-
-		if shouldUpdateRule {
-			log.WithFields(logrus.Fields{
-				"ruleIndex": i,
-				"oldTarget": oldTarget,
-			}).Debug("updating HTTPRoute rule")
-
-			route.Spec.Rules[i].BackendRefs = []gatewayv1.HTTPBackendRef{
-				{
-					BackendRef: gatewayv1.BackendRef{
-						BackendObjectReference: gatewayv1.BackendObjectReference{
-							Name: targetName,
-							Port: &targetPort,
-						},
-					},
-				},
-			}
-			updated = true
-		}
 	}
-
 	if !updated {
 		return fmt.Errorf("HTTPRoute %s: %w", routeName, ErrNoSuitableRules)
 	}
 
-	_, err = c.gatewayClient.GatewayV1().HTTPRoutes(c.namespace).Update(ctx, route, metav1.UpdateOptions{})
-	if err != nil {
+	if _, err := c.gatewayClient.GatewayV1().HTTPRoutes(c.namespace).Update(ctx, route, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("failed to update HTTPRoute %s: %w", routeName, err)
 	}
 
-	log.Info("successfully updated HTTPRoute maintenance mode")
+	log.Info("disabled maintenance mode (legacy fallback)")
 	return nil
+}
+
+// newBackendRef builds a single-service HTTPBackendRef pointing at the given service and port.
+func newBackendRef(name string, port int32) gatewayv1.HTTPBackendRef {
+	p := gatewayv1.PortNumber(port)
+	return gatewayv1.HTTPBackendRef{
+		BackendRef: gatewayv1.BackendRef{
+			BackendObjectReference: gatewayv1.BackendObjectReference{
+				Name: gatewayv1.ObjectName(name),
+				Port: &p,
+			},
+		},
+	}
 }

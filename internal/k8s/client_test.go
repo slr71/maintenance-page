@@ -9,22 +9,47 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayfake "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/fake"
 )
 
-func TestEnsureService(t *testing.T) {
-	clientset := fake.NewSimpleClientset()
-	gwClient := gatewayfake.NewClientset()
-	namespace := "test-ns"
+// newTestClient builds a Client backed by the given (optional) HTTPRoutes.
+func newTestClient(t *testing.T, namespace string, routes ...*gatewayv1.HTTPRoute) (*Client, *gatewayfake.Clientset) {
+	t.Helper()
+	objs := make([]runtime.Object, 0, len(routes))
+	for _, r := range routes {
+		objs = append(objs, r)
+	}
+	gwClient := gatewayfake.NewClientset(objs...)
 	log := logrus.New()
-	client := &Client{
-		clientset:     clientset,
+	return &Client{
+		clientset:     fake.NewSimpleClientset(),
 		gatewayClient: gwClient,
 		namespace:     namespace,
 		log:           log.WithField("component", "k8s-client"),
+	}, gwClient
+}
+
+// ruleWithBackend builds a single-backend HTTPRouteRule for use in tests.
+func ruleWithBackend(name string) gatewayv1.HTTPRouteRule {
+	return gatewayv1.HTTPRouteRule{
+		BackendRefs: []gatewayv1.HTTPBackendRef{
+			{
+				BackendRef: gatewayv1.BackendRef{
+					BackendObjectReference: gatewayv1.BackendObjectReference{
+						Name: gatewayv1.ObjectName(name),
+					},
+				},
+			},
+		},
 	}
+}
+
+func TestEnsureService(t *testing.T) {
+	client, _ := newTestClient(t, "test-ns")
+	clientset := client.clientset
 
 	ctx := context.Background()
 	name := "test-service"
@@ -36,7 +61,7 @@ func TestEnsureService(t *testing.T) {
 	err := client.EnsureService(ctx, name, port, targetPort, labels)
 	require.NoError(t, err)
 
-	svc, err := clientset.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+	svc, err := clientset.CoreV1().Services("test-ns").Get(ctx, name, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, name, svc.Name)
 	assert.Equal(t, port, svc.Spec.Ports[0].Port)
@@ -48,42 +73,18 @@ func TestEnsureService(t *testing.T) {
 }
 
 func TestIsMaintenanceMode(t *testing.T) {
-	clientset := fake.NewSimpleClientset()
 	namespace := "test-ns"
 	routeName := "test-route"
 	maintSvcName := "maint-svc"
 
 	route := &gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      routeName,
-			Namespace: namespace,
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: routeName, Namespace: namespace},
 		Spec: gatewayv1.HTTPRouteSpec{
-			Rules: []gatewayv1.HTTPRouteRule{
-				{
-					BackendRefs: []gatewayv1.HTTPBackendRef{
-						{
-							BackendRef: gatewayv1.BackendRef{
-								BackendObjectReference: gatewayv1.BackendObjectReference{
-									Name: gatewayv1.ObjectName(maintSvcName),
-								},
-							},
-						},
-					},
-				},
-			},
+			Rules: []gatewayv1.HTTPRouteRule{ruleWithBackend(maintSvcName)},
 		},
 	}
 
-	gwClient := gatewayfake.NewClientset(route)
-	log := logrus.New()
-	client := &Client{
-		clientset:     clientset,
-		gatewayClient: gwClient,
-		namespace:     namespace,
-		log:           log.WithField("component", "k8s-client"),
-	}
-
+	client, _ := newTestClient(t, namespace, route)
 	ctx := context.Background()
 
 	// Test ON
@@ -101,118 +102,177 @@ func TestIsMaintenanceMode(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestSetMaintenanceMode(t *testing.T) {
-	clientset := fake.NewSimpleClientset()
+func TestEnableMaintenanceMode(t *testing.T) {
 	namespace := "test-ns"
-	routeName := "test-route"
+	maintSvc := "maintenance-page"
+	maintPort := int32(80)
 
-	route := &gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      routeName,
-			Namespace: namespace,
-		},
-		Spec: gatewayv1.HTTPRouteSpec{
-			Rules: []gatewayv1.HTTPRouteRule{
-				{
-					BackendRefs: []gatewayv1.HTTPBackendRef{
-						{
-							BackendRef: gatewayv1.BackendRef{
-								BackendObjectReference: gatewayv1.BackendObjectReference{
-									Name: gatewayv1.ObjectName("sonora"),
-								},
-							},
-						},
-					},
+	t.Run("redirects every rule and snapshots originals", func(t *testing.T) {
+		// Mirror the production HTTPRoute shape: several distinct backends behind
+		// different path prefixes. The bug being fixed was that only the rule
+		// pointing at the catch-all (sonora) was redirected.
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "discoenv-routes", Namespace: namespace},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					ruleWithBackend("kifshare"),
+					ruleWithBackend("terrain"),
+					ruleWithBackend("job-status-listener"),
+					ruleWithBackend("sonora"),
 				},
 			},
-		},
-	}
+		}
+		client, gw := newTestClient(t, namespace, route)
+		ctx := context.Background()
 
-	gwClient := gatewayfake.NewClientset(route)
-	log := logrus.New()
-	client := &Client{
-		clientset:     clientset,
-		gatewayClient: gwClient,
-		namespace:     namespace,
-		log:           log.WithField("component", "k8s-client"),
-	}
+		require.NoError(t, client.EnableMaintenanceMode(ctx, "discoenv-routes", maintSvc, maintPort))
 
-	ctx := context.Background()
+		got, err := gw.GatewayV1().HTTPRoutes(namespace).Get(ctx, "discoenv-routes", metav1.GetOptions{})
+		require.NoError(t, err)
 
-	// Set to maintenance
-	err := client.SetMaintenanceMode(ctx, routeName, "maint-svc", 80, []string{"sonora", "maint-svc"})
-	require.NoError(t, err)
+		// Every rule should now point at the maintenance service.
+		for i, rule := range got.Spec.Rules {
+			require.Lenf(t, rule.BackendRefs, 1, "rule %d", i)
+			assert.Equalf(t, gatewayv1.ObjectName(maintSvc), rule.BackendRefs[0].Name, "rule %d", i)
+		}
 
-	updatedRoute, err := gwClient.GatewayV1().HTTPRoutes(namespace).Get(ctx, routeName, metav1.GetOptions{})
-	require.NoError(t, err)
-	assert.Equal(t, gatewayv1.ObjectName("maint-svc"), updatedRoute.Spec.Rules[0].BackendRefs[0].Name)
+		// And the snapshot annotation should preserve the originals so they can be restored.
+		snap, ok := got.Annotations[AnnotationOriginalBackends]
+		require.True(t, ok, "snapshot annotation should be present")
+		assert.Contains(t, snap, "kifshare")
+		assert.Contains(t, snap, "terrain")
+		assert.Contains(t, snap, "job-status-listener")
+		assert.Contains(t, snap, "sonora")
+	})
 
-	// Set back to sonora
-	err = client.SetMaintenanceMode(ctx, routeName, "sonora", 80, []string{"sonora", "maint-svc"})
-	require.NoError(t, err)
+	t.Run("idempotent when annotation already present", func(t *testing.T) {
+		// Simulate a route already in maintenance: every rule points at maintenance-page
+		// and the annotation holds the real originals. Calling Enable again must not
+		// overwrite that snapshot with the all-maintenance state.
+		const presetSnapshot = `[[{"name":"sonora"}]]`
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "already-on",
+				Namespace:   namespace,
+				Annotations: map[string]string{AnnotationOriginalBackends: presetSnapshot},
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{ruleWithBackend(maintSvc)},
+			},
+		}
+		client, gw := newTestClient(t, namespace, route)
+		ctx := context.Background()
 
-	updatedRoute, err = gwClient.GatewayV1().HTTPRoutes(namespace).Get(ctx, routeName, metav1.GetOptions{})
-	require.NoError(t, err)
-	assert.Equal(t, gatewayv1.ObjectName("sonora"), updatedRoute.Spec.Rules[0].BackendRefs[0].Name)
+		require.NoError(t, client.EnableMaintenanceMode(ctx, "already-on", maintSvc, maintPort))
 
-	// Test with multiple rules
-	multiRuleRoute := &gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "multi-rule",
-			Namespace: namespace,
-		},
-		Spec: gatewayv1.HTTPRouteSpec{
-			Rules: []gatewayv1.HTTPRouteRule{
-				{
-					BackendRefs: []gatewayv1.HTTPBackendRef{
-						{
-							BackendRef: gatewayv1.BackendRef{
-								BackendObjectReference: gatewayv1.BackendObjectReference{
-									Name: gatewayv1.ObjectName("sonora"),
-								},
-							},
-						},
-					},
-				},
-				{
-					BackendRefs: []gatewayv1.HTTPBackendRef{
-						{
-							BackendRef: gatewayv1.BackendRef{
-								BackendObjectReference: gatewayv1.BackendObjectReference{
-									Name: gatewayv1.ObjectName("maint-svc"),
-								},
-							},
-						},
-					},
+		got, err := gw.GatewayV1().HTTPRoutes(namespace).Get(ctx, "already-on", metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, presetSnapshot, got.Annotations[AnnotationOriginalBackends])
+	})
+
+	t.Run("empty rules returns ErrNoSuitableRules", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "empty", Namespace: namespace},
+			Spec:       gatewayv1.HTTPRouteSpec{Rules: nil},
+		}
+		client, _ := newTestClient(t, namespace, route)
+		err := client.EnableMaintenanceMode(context.Background(), "empty", maintSvc, maintPort)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrNoSuitableRules))
+	})
+
+	t.Run("route not found", func(t *testing.T) {
+		client, _ := newTestClient(t, namespace)
+		err := client.EnableMaintenanceMode(context.Background(), "missing", maintSvc, maintPort)
+		require.Error(t, err)
+	})
+}
+
+func TestDisableMaintenanceMode(t *testing.T) {
+	namespace := "test-ns"
+	maintSvc := "maintenance-page"
+	fallbackSvc := "sonora"
+	port := int32(80)
+
+	t.Run("restores per-rule backends from annotation", func(t *testing.T) {
+		// Round-trip: Enable populates the annotation, Disable consumes it.
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "discoenv-routes", Namespace: namespace},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					ruleWithBackend("kifshare"),
+					ruleWithBackend("terrain"),
+					ruleWithBackend("sonora"),
 				},
 			},
-		},
-	}
-	_, _ = gwClient.GatewayV1().HTTPRoutes(namespace).Create(ctx, multiRuleRoute, metav1.CreateOptions{})
-	err = client.SetMaintenanceMode(ctx, "multi-rule", "new-svc", 80, []string{"sonora", "maint-svc"})
-	require.NoError(t, err)
+		}
+		client, gw := newTestClient(t, namespace, route)
+		ctx := context.Background()
 
-	updatedRoute, err = gwClient.GatewayV1().HTTPRoutes(namespace).Get(ctx, "multi-rule", metav1.GetOptions{})
-	require.NoError(t, err)
-	assert.Equal(t, gatewayv1.ObjectName("new-svc"), updatedRoute.Spec.Rules[0].BackendRefs[0].Name)
-	assert.Equal(t, gatewayv1.ObjectName("new-svc"), updatedRoute.Spec.Rules[1].BackendRefs[0].Name)
+		require.NoError(t, client.EnableMaintenanceMode(ctx, "discoenv-routes", maintSvc, port))
+		require.NoError(t, client.DisableMaintenanceMode(ctx, "discoenv-routes", maintSvc, fallbackSvc, port))
 
-	// Test no suitable rules found
-	routeNoRules := &gatewayv1.HTTPRoute{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "no-rules",
-			Namespace: namespace,
-		},
-		Spec: gatewayv1.HTTPRouteSpec{
-			Rules: []gatewayv1.HTTPRouteRule{
-				{
-					BackendRefs: []gatewayv1.HTTPBackendRef{},
+		got, err := gw.GatewayV1().HTTPRoutes(namespace).Get(ctx, "discoenv-routes", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		want := []string{"kifshare", "terrain", "sonora"}
+		require.Len(t, got.Spec.Rules, len(want))
+		for i, name := range want {
+			require.Lenf(t, got.Spec.Rules[i].BackendRefs, 1, "rule %d", i)
+			assert.Equalf(t, gatewayv1.ObjectName(name), got.Spec.Rules[i].BackendRefs[0].Name, "rule %d", i)
+		}
+		_, ok := got.Annotations[AnnotationOriginalBackends]
+		assert.False(t, ok, "annotation should be cleared after restore")
+	})
+
+	t.Run("legacy fallback when annotation missing", func(t *testing.T) {
+		// Simulates a route that was put into maintenance by the previous code path,
+		// which only redirected the catch-all rule and didn't write the annotation.
+		// The fallback should redirect just that rule back to sonora.
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: namespace},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{
+					ruleWithBackend("terrain"),
+					ruleWithBackend(maintSvc),
 				},
 			},
-		},
-	}
-	_, _ = gwClient.GatewayV1().HTTPRoutes(namespace).Create(ctx, routeNoRules, metav1.CreateOptions{})
-	err = client.SetMaintenanceMode(ctx, "no-rules", "maint-svc", 80, []string{"sonora", "maint-svc"})
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrNoSuitableRules))
+		}
+		client, gw := newTestClient(t, namespace, route)
+		ctx := context.Background()
+
+		require.NoError(t, client.DisableMaintenanceMode(ctx, "legacy", maintSvc, fallbackSvc, port))
+
+		got, err := gw.GatewayV1().HTTPRoutes(namespace).Get(ctx, "legacy", metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, gatewayv1.ObjectName("terrain"), got.Spec.Rules[0].BackendRefs[0].Name)
+		assert.Equal(t, gatewayv1.ObjectName(fallbackSvc), got.Spec.Rules[1].BackendRefs[0].Name)
+	})
+
+	t.Run("legacy fallback with no maintenance-backed rule errors", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: "nothing-to-do", Namespace: namespace},
+			Spec: gatewayv1.HTTPRouteSpec{
+				Rules: []gatewayv1.HTTPRouteRule{ruleWithBackend("terrain")},
+			},
+		}
+		client, _ := newTestClient(t, namespace, route)
+		err := client.DisableMaintenanceMode(context.Background(), "nothing-to-do", maintSvc, fallbackSvc, port)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, ErrNoSuitableRules))
+	})
+
+	t.Run("malformed annotation surfaces decode error", func(t *testing.T) {
+		route := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "garbled",
+				Namespace:   namespace,
+				Annotations: map[string]string{AnnotationOriginalBackends: "not json"},
+			},
+			Spec: gatewayv1.HTTPRouteSpec{Rules: []gatewayv1.HTTPRouteRule{ruleWithBackend(maintSvc)}},
+		}
+		client, _ := newTestClient(t, namespace, route)
+		err := client.DisableMaintenanceMode(context.Background(), "garbled", maintSvc, fallbackSvc, port)
+		require.Error(t, err)
+	})
 }
