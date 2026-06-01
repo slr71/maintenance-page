@@ -22,10 +22,44 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// isDocumentNavigation reports whether a request is a top-level browser page load
+// (vs. an XHR/fetch API call). It relies on the Sec-Fetch-* headers that modern
+// browsers send, falling back to the Accept header for clients that omit them.
+// We use this to decide whether an unmatched path should receive the maintenance
+// HTML page (navigation) or a 503 (API call), without needing a hardcoded path list.
+func isDocumentNavigation(r *http.Request) bool {
+	mode := r.Header.Get("Sec-Fetch-Mode")
+	dest := r.Header.Get("Sec-Fetch-Dest")
+	if mode != "" || dest != "" {
+		return mode == "navigate" || dest == "document" || dest == "iframe" || dest == "frame"
+	}
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
+}
+
+// serveMaintenanceResponse serves the maintenance HTML page for browser navigations
+// and a 503 for XHR/API calls. The 503 carries the X-Maintenance-Mode marker so the
+// DE UI can distinguish gateway maintenance from an incidental backend 503 and force
+// a hard reload (which lands the user on the maintenance page).
+func serveMaintenanceResponse(c echo.Context, defaultPath string) error {
+	if isDocumentNavigation(c.Request()) {
+		return c.File(defaultPath)
+	}
+	h := c.Response().Header()
+	h.Set("X-Maintenance-Mode", "true")
+	h.Set("Retry-After", "300")
+	h.Set("Cache-Control", "no-store")
+	return c.JSON(http.StatusServiceUnavailable, map[string]any{
+		"error_code":  "ERR_MAINTENANCE",
+		"maintenance": true,
+		"message":     "The Discovery Environment is currently under maintenance.",
+	})
+}
+
 // maintenanceMiddleware serves static files from a directory for any base URL path. It works by inspecting the URL
-// path. If the URL path ends with a slash then the contents of `maintenance_index.html` are returned. Otherwise, the
-// base name is extracted from the URL. If a file with that base name exists in the directory then the contents of that
-// file are returned. Otherwise, the contents of `maintenance_index.html` are returned.
+// path. The base name is extracted from the URL; if a file with that base name exists in the directory then the
+// contents of that file are returned (so the maintenance page's own assets always load). Otherwise the request is
+// served by serveMaintenanceResponse, which returns the maintenance page for browser navigations and a 503 for
+// XHR/API calls.
 // The absDir parameter must be an absolute path to the maintenance page directory.
 func maintenanceMiddleware(absDir string) echo.MiddlewareFunc {
 	// Matches the last path segment in a URL path (e.g., "/foo" in "/a/b/foo").
@@ -36,26 +70,27 @@ func maintenanceMiddleware(absDir string) echo.MiddlewareFunc {
 			urlPath := c.Request().URL.Path
 			defaultPath := filepath.Join(absDir, "maintenance_index.html")
 
-			// Extract the basename from the URL path, returning the default file if the basename is empty.
+			// Extract the basename from the URL path, falling back to the default response if it's empty.
 			basename := strings.TrimPrefix(basenameRegex.FindString(urlPath), "/")
 			if basename == "" {
-				return c.File(defaultPath)
+				return serveMaintenanceResponse(c, defaultPath)
 			}
 
 			// Resolve the full path and verify it's still within the maintenance page directory.
 			filePath := filepath.Join(absDir, filepath.Clean(basename))
 			resolved, err := filepath.Abs(filePath)
 			if err != nil || !strings.HasPrefix(resolved, absDir+string(os.PathSeparator)) {
-				return c.File(defaultPath)
+				return serveMaintenanceResponse(c, defaultPath)
 			}
 
-			// Return the file if it exists.
+			// Return the file if it exists. This always serves the maintenance page's own assets with a 200,
+			// regardless of request type.
 			if info, err := os.Stat(resolved); err == nil && !info.IsDir() {
 				return c.File(resolved)
 			}
 
-			// Fall back to the default path.
-			return c.File(defaultPath)
+			// Fall back to the default response.
+			return serveMaintenanceResponse(c, defaultPath)
 		}
 	}
 }
