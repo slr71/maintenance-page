@@ -24,6 +24,27 @@ func newTestMaintenanceDir(t *testing.T) string {
 	return abs
 }
 
+// TestHealthEndpoint verifies the probe endpoint returns 200 even though the
+// maintenance catch-all middleware would otherwise turn a kube-probe request
+// (Accept: */*, no Sec-Fetch headers) into a 503.
+func TestHealthEndpoint(t *testing.T) {
+	absDir := newTestMaintenanceDir(t)
+	e := echo.New()
+	e.Use(maintenanceMiddleware(absDir))
+	e.GET(healthPath, func(c echo.Context) error {
+		return c.NoContent(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, healthPath, nil)
+	req.Header.Set("User-Agent", "kube-probe/1.29")
+	req.Header.Set("Accept", "*/*")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Empty(t, rec.Header().Get("X-Maintenance-Mode"))
+}
+
 func TestMaintenanceMiddleware(t *testing.T) {
 	absDir := newTestMaintenanceDir(t)
 	handler := maintenanceMiddleware(absDir)(func(c echo.Context) error {

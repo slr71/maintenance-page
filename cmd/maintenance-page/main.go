@@ -22,6 +22,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// healthPath is the liveness/readiness probe endpoint. It is served before the
+// maintenance catch-all so probes always get a 200, even while maintenance mode
+// returns 503s to API clients.
+const healthPath = "/healthz"
+
 // isDocumentNavigation reports whether a request is a top-level browser page load
 // (vs. an XHR/fetch API call). It relies on the Sec-Fetch-* headers that modern
 // browsers send, falling back to the Accept header for clients that omit them.
@@ -68,6 +73,12 @@ func maintenanceMiddleware(absDir string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			urlPath := c.Request().URL.Path
+
+			// Let the health check through; it must respond 200 regardless of maintenance state.
+			if urlPath == healthPath {
+				return next(c)
+			}
+
 			defaultPath := filepath.Join(absDir, "maintenance_index.html")
 
 			// Extract the basename from the URL path, falling back to the default response if it's empty.
@@ -181,6 +192,9 @@ func main() {
 	// Setup Maintenance Page Server
 	maintenanceEcho := setupEcho(log)
 	maintenanceEcho.Use(maintenanceMiddleware(absDir))
+	maintenanceEcho.GET(healthPath, func(c echo.Context) error {
+		return c.NoContent(http.StatusOK)
+	})
 
 	// Setup Admin Page Server
 	adminEcho := setupEcho(log)
