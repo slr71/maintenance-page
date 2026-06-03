@@ -31,9 +31,7 @@ func TestHealthEndpoint(t *testing.T) {
 	absDir := newTestMaintenanceDir(t)
 	e := echo.New()
 	e.Use(maintenanceMiddleware(absDir))
-	e.GET(healthPath, func(c echo.Context) error {
-		return c.NoContent(http.StatusOK)
-	})
+	registerHealthCheck(e)
 
 	req := httptest.NewRequest(http.MethodGet, healthPath, nil)
 	req.Header.Set("User-Agent", "kube-probe/1.29")
@@ -58,13 +56,15 @@ func TestMaintenanceMiddleware(t *testing.T) {
 		wantStatus     int
 		wantBody       string
 		wantMaintainer bool // expect X-Maintenance-Mode marker header
+		wantNoStore    bool // expect Cache-Control: no-store
 	}{
 		{
-			name:       "document navigation serves the maintenance page",
-			path:       "/apps",
-			headers:    map[string]string{"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"},
-			wantStatus: http.StatusOK,
-			wantBody:   "<html>maintenance</html>",
+			name:        "document navigation serves the maintenance page",
+			path:        "/apps",
+			headers:     map[string]string{"Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"},
+			wantStatus:  http.StatusOK,
+			wantBody:    "<html>maintenance</html>",
+			wantNoStore: true,
 		},
 		{
 			name:           "xhr api call gets a 503 with the maintenance marker",
@@ -72,6 +72,7 @@ func TestMaintenanceMiddleware(t *testing.T) {
 			headers:        map[string]string{"Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty", "Accept": "application/json"},
 			wantStatus:     http.StatusServiceUnavailable,
 			wantMaintainer: true,
+			wantNoStore:    true,
 		},
 		{
 			name:       "existing asset is always served even with a non-document dest",
@@ -81,11 +82,12 @@ func TestMaintenanceMiddleware(t *testing.T) {
 			wantBody:   "body{}",
 		},
 		{
-			name:       "no Sec-Fetch headers with html accept serves the page",
-			path:       "/dashboard",
-			headers:    map[string]string{"Accept": "text/html,application/xhtml+xml"},
-			wantStatus: http.StatusOK,
-			wantBody:   "<html>maintenance</html>",
+			name:        "no Sec-Fetch headers with html accept serves the page",
+			path:        "/dashboard",
+			headers:     map[string]string{"Accept": "text/html,application/xhtml+xml"},
+			wantStatus:  http.StatusOK,
+			wantBody:    "<html>maintenance</html>",
+			wantNoStore: true,
 		},
 		{
 			name:           "no Sec-Fetch headers with json accept gets a 503",
@@ -93,20 +95,23 @@ func TestMaintenanceMiddleware(t *testing.T) {
 			headers:        map[string]string{"Accept": "application/json, text/plain, */*"},
 			wantStatus:     http.StatusServiceUnavailable,
 			wantMaintainer: true,
+			wantNoStore:    true,
 		},
 		{
-			name:       "root path navigation serves the page",
-			path:       "/",
-			headers:    map[string]string{"Sec-Fetch-Mode": "navigate"},
-			wantStatus: http.StatusOK,
-			wantBody:   "<html>maintenance</html>",
+			name:        "root path navigation serves the page",
+			path:        "/",
+			headers:     map[string]string{"Sec-Fetch-Mode": "navigate"},
+			wantStatus:  http.StatusOK,
+			wantBody:    "<html>maintenance</html>",
+			wantNoStore: true,
 		},
 		{
-			name:       "path traversal attempt falls back to the maintenance page",
-			path:       "/../../../etc/passwd",
-			headers:    map[string]string{"Sec-Fetch-Mode": "navigate"},
-			wantStatus: http.StatusOK,
-			wantBody:   "<html>maintenance</html>",
+			name:        "path traversal attempt falls back to the maintenance page",
+			path:        "/../../../etc/passwd",
+			headers:     map[string]string{"Sec-Fetch-Mode": "navigate"},
+			wantStatus:  http.StatusOK,
+			wantBody:    "<html>maintenance</html>",
+			wantNoStore: true,
 		},
 	}
 
@@ -132,6 +137,10 @@ func TestMaintenanceMiddleware(t *testing.T) {
 				assert.Contains(t, rec.Body.String(), `"maintenance":true`)
 			} else {
 				assert.Empty(t, rec.Header().Get("X-Maintenance-Mode"))
+			}
+
+			if tt.wantNoStore {
+				assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
 			}
 		})
 	}

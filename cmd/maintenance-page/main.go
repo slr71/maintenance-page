@@ -27,6 +27,13 @@ import (
 // returns 503s to API clients.
 const healthPath = "/healthz"
 
+// registerHealthCheck wires the liveness/readiness probe endpoint onto e.
+func registerHealthCheck(e *echo.Echo) {
+	e.GET(healthPath, func(c echo.Context) error {
+		return c.NoContent(http.StatusOK)
+	})
+}
+
 // isDocumentNavigation reports whether a request is a top-level browser page load
 // (vs. an XHR/fetch API call). It relies on the Sec-Fetch-* headers that modern
 // browsers send, falling back to the Accept header for clients that omit them.
@@ -47,6 +54,8 @@ func isDocumentNavigation(r *http.Request) bool {
 // a hard reload (which lands the user on the maintenance page).
 func serveMaintenanceResponse(c echo.Context, defaultPath string) error {
 	if isDocumentNavigation(c.Request()) {
+		// no-store so the page isn't cached and re-shown after maintenance ends.
+		c.Response().Header().Set("Cache-Control", "no-store")
 		return c.File(defaultPath)
 	}
 	h := c.Response().Header()
@@ -192,9 +201,7 @@ func main() {
 	// Setup Maintenance Page Server
 	maintenanceEcho := setupEcho(log)
 	maintenanceEcho.Use(maintenanceMiddleware(absDir))
-	maintenanceEcho.GET(healthPath, func(c echo.Context) error {
-		return c.NoContent(http.StatusOK)
-	})
+	registerHealthCheck(maintenanceEcho)
 
 	// Setup Admin Page Server
 	adminEcho := setupEcho(log)
